@@ -108,9 +108,13 @@ def train(args, train_dataset, model, tokenizer):
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
+
+    # Counter for printing loss values of the first five minibatches
+    minibatch_counter = 0
+
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
+    for epoch in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             model.train()
@@ -122,6 +126,11 @@ def train(args, train_dataset, model, tokenizer):
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
+            # Print loss for the first five minibatches
+            if minibatch_counter < 5:
+                print("Minibatch {} loss: {:.4f}".format(minibatch_counter + 1, loss.item()))
+            minibatch_counter += 1
+
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
@@ -132,7 +141,7 @@ def train(args, train_dataset, model, tokenizer):
             else:
                 ##################################################
                 # TODO(cos568): perform backward pass here (expect one line of code)
-                
+                loss.backward()
                 ##################################################
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
@@ -140,7 +149,7 @@ def train(args, train_dataset, model, tokenizer):
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
-                
+                optimizer.step()
                 ##################################################
                 scheduler.step() # Update learning rate schedule
                 model.zero_grad()
@@ -155,7 +164,7 @@ def train(args, train_dataset, model, tokenizer):
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-
+        evaluate(args, model, tokenizer, prefix="Epoch {}".format(epoch+1))
         ##################################################
 
     return global_step, tr_loss / global_step
@@ -309,7 +318,8 @@ def main():
     parser.add_argument("--do_lower_case", action='store_true',
                         help="Set this flag if you are using an uncased model.")
 
-    parser.add_argument("--per_device_train_batch_size", default=8, type=int,
+    # Updated default batch size to 64
+    parser.add_argument("--per_device_train_batch_size", default=64, type=int,
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--per_device_eval_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
@@ -388,7 +398,7 @@ def main():
     ##################################################
     # TODO(cos568): load the model using from_pretrained. Remember to pass in `config` as an argument.
     # If you pass in args.model_name_or_path (e.g. "bert-base-cased"), the model weights file will be downloaded from HuggingFace. (expect one line of code)
-
+    model = model_class.from_pretrained(args.model_name_or_path, config=config)
     ##################################################
 
     if args.local_rank == 0:
