@@ -125,7 +125,7 @@ def train(args, train_dataset, model, tokenizer):
                     scaled_loss.backward()
                 torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
             else:
-                # Task 2(b): Backward pass and gradient synchronization using all_reduce
+                # 2(b): gradient synchronization using all_reduce
                 loss.backward()
                 if args.world_size > 1:
                     for p in model.parameters():
@@ -301,8 +301,6 @@ def main():
     parser.add_argument("--do_train", action='store_true', help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true', help="Whether to run eval on the dev set.")
     parser.add_argument("--do_lower_case", action='store_true', help="Set this flag if you are using an uncased model.")
-
-    # For Task 2(b): run for 1 epoch.
     parser.add_argument("--per_device_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--per_device_eval_batch_size", default=8, type=int,
@@ -385,7 +383,7 @@ def main():
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
                                                   do_lower_case=args.do_lower_case)
     
-    # Task 2b: Load pretrained model (with config)
+    # Load pretrained model (with config)
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
 
     if args.local_rank == 0:

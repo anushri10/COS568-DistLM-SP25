@@ -1,7 +1,6 @@
 # coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # (License text omitted for brevity)
-""" Finetuning the library models for sequence classification on GLUE (Bert, XLM, XLNet, RoBERTa)."""
+"""Finetuning the library models for sequence classification on GLUE using PyTorch DistributedDataParallel (Task 3)."""
 
 from __future__ import absolute_import, division, print_function
 
@@ -10,34 +9,29 @@ import glob
 import logging
 import os
 import random
-import time  # <--- Added for timing
+import time  # For timing iterations
 
 import numpy as np
 import torch
-from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
-                              TensorDataset)
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
-# import a previous version of the HuggingFace Transformers package
+# Import models and tokenizers from pytorch_transformers
 from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
                                   BertForSequenceClassification, BertTokenizer,
-                                  RobertaConfig,
-                                  RobertaForSequenceClassification,
-                                  RobertaTokenizer,
-                                  XLMConfig, XLMForSequenceClassification,
-                                  XLMTokenizer, XLNetConfig,
-                                  XLNetForSequenceClassification,
-                                  XLNetTokenizer)
+                                  RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer,
+                                  XLMConfig, XLMForSequenceClassification, XLMTokenizer,
+                                  XLNetConfig, XLNetForSequenceClassification, XLNetTokenizer)
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
-from utils_glue import (compute_metrics, convert_examples_to_features,
-                        output_modes, processors)
+from utils_glue import compute_metrics, convert_examples_to_features, output_modes, processors
 
 logger = logging.getLogger(__name__)
 
-ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig, XLMConfig, RobertaConfig)), ())
+ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) 
+                  for conf in (BertConfig, XLNetConfig, XLMConfig, RobertaConfig)), ())
 
 MODEL_CLASSES = {
     'bert': (BertConfig, BertForSequenceClassification, BertTokenizer),
@@ -57,10 +51,17 @@ def set_seed(args):
 
 
 def train(args, train_dataset, model, tokenizer):
-    """ Train the model """
-
+    """Train the model using DistributedDataParallel.
+       DDP automatically synchronizes gradients during the backward pass.
+    """
     args.train_batch_size = args.per_device_train_batch_size
-    train_sampler = RandomSampler(train_dataset)
+
+    # If using distributed sampler, wrap the dataset sampler appropriately.
+    if args.world_size > 1:
+        train_sampler = DistributedSampler(train_dataset)
+    else:
+        train_sampler = RandomSampler(train_dataset)
+
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
 
     if args.max_steps > 0:
@@ -69,7 +70,7 @@ def train(args, train_dataset, model, tokenizer):
     else:
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    # Prepare optimizer and schedule (linear warmup and decay)
+    # Prepare optimizer and learning rate scheduler
     no_decay = ['bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
@@ -79,98 +80,61 @@ def train(args, train_dataset, model, tokenizer):
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
-    # Log training parameters
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  Instantaneous batch size per device = %d", args.per_device_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                args.train_batch_size * args.gradient_accumulation_steps *
-                (torch.distributed.get_world_size() if args.world_size > 1 else 1))
+    total_train_batch_size = args.train_batch_size * args.gradient_accumulation_steps * (args.world_size if args.world_size > 1 else 1)
+    logger.info("  Total train batch size = %d", total_train_batch_size)
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
     global_step = 0
-    tr_loss, logging_loss = 0.0, 0.0
+    tr_loss = 0.0
     model.zero_grad()
-    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
+    train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=(args.local_rank not in [-1, 0]))
     
-    set_seed(args)  # for reproducibility
-    
+    set_seed(args)  # For reproducibility
+
     for epoch in train_iterator:
-        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-        # For timing and loss curve logging (Task 2,3)
-        iteration_times = []
-        loss_curve = []
+        if args.world_size > 1:
+            # Shuffle the data for each epoch in distributed training
+            train_sampler.set_epoch(epoch)
+        epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=(args.local_rank not in [-1, 0]))
+        iteration_times = []  # For timing iterations
+        loss_curve = []       # To log loss per iteration
         first_iter = True
-        
+
         for step, batch in enumerate(epoch_iterator):
-            start_time = time.time()  # Start timing iteration
-            
+            start_time = time.time()
+
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {
-                'input_ids':      batch[0],
+                'input_ids': batch[0],
                 'attention_mask': batch[1],
                 'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
-                'labels':         batch[3]
+                'labels': batch[3]
             }
             outputs = model(**inputs)
-            loss = outputs[0]  # loss is the first output
-            
+            loss = outputs[0]
+
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-            else:
-                ##################################################
-                # Task 2a: Performing distributed gradient synchronization
-                loss.backward()
-                if args.world_size > 1:
-                    # For each parameter, gather gradients on rank 0, average, and scatter back.
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            if args.local_rank == 0:
-                                grad_list = [torch.zeros_like(p.grad) for _ in range(args.world_size)]
-                                torch.distributed.gather(p.grad, gather_list=grad_list, dst=0)
-                                avg_grad = sum(grad_list) / args.world_size
-                            else:
-                                torch.distributed.gather(p.grad, gather_list=None, dst=0)
-                            avg_grad_tensor = torch.empty_like(p.grad)
-                            if args.local_rank == 0:
-                                scatter_list = [avg_grad for _ in range(args.world_size)]
-                            else:
-                                scatter_list = None
-                            torch.distributed.scatter(avg_grad_tensor, scatter_list=scatter_list, src=0)
-                            p.grad.copy_(avg_grad_tensor)
-                ##################################################
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
+            loss.backward()
             tr_loss += loss.item()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                ##################################################
-                # Task 2a: 
                 optimizer.step()
-                ##################################################
-                scheduler.step()  # update learning rate schedule
+                scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
 
-            end_time = time.time()  # End timing iteration
-            # Record iteration time (discard first iteration)
+            end_time = time.time()
             if first_iter:
-                first_iter = False
+                first_iter = False  # Discard the first iteration's timing
             else:
                 iteration_times.append(end_time - start_time)
             loss_curve.append(loss.item())
@@ -179,24 +143,20 @@ def train(args, train_dataset, model, tokenizer):
                 epoch_iterator.close()
                 break
 
-        # End of epoch: log timing and loss curve info (Task 2,3)
         if iteration_times:
             avg_iter_time = sum(iteration_times) / len(iteration_times)
-            logger.info("Epoch %d: Average time per iteration (excluding first iteration): %.4f seconds", epoch + 1, avg_iter_time)
+            logger.info("Epoch %d: Average iteration time (excluding first iteration): %.4f seconds", epoch + 1, avg_iter_time)
             logger.info("Epoch %d: Loss curve: %s", epoch + 1, loss_curve)
 
-        ##################################################
-        # Task 2a: Call evaluate() after each epoch
         evaluate(args, model, tokenizer, prefix="Epoch {}".format(epoch + 1))
-        ##################################################
 
     return global_step, tr_loss / global_step
 
 
 def evaluate(args, model, tokenizer, prefix=""):
-    # (evaluation code remains unchanged)
-    eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
-    eval_outputs_dirs = (args.output_dir, args.output_dir + '-MM') if args.task_name == "mnli" else (args.output_dir,)
+    # Evaluation: run on the dev set and write results to the output directory.
+    eval_task_names = (args.task_name,) if args.task_name != "mnli" else ("mnli", "mnli-mm")
+    eval_outputs_dirs = (args.output_dir,) if args.task_name != "mnli" else (args.output_dir, args.output_dir + "-MM")
 
     results = {}
     for eval_task, eval_output_dir in zip(eval_task_names, eval_outputs_dirs):
@@ -216,20 +176,19 @@ def evaluate(args, model, tokenizer, prefix=""):
         nb_eval_steps = 0
         preds = None
         out_label_ids = None
+
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
-
             with torch.no_grad():
                 inputs = {
-                    'input_ids':      batch[0],
+                    'input_ids': batch[0],
                     'attention_mask': batch[1],
                     'token_type_ids': batch[2] if args.model_type in ['bert', 'xlnet'] else None,
-                    'labels':         batch[3]
+                    'labels': batch[3]
                 }
                 outputs = model(**inputs)
                 tmp_eval_loss, logits = outputs[:2]
-
                 eval_loss += tmp_eval_loss.mean().item()
             nb_eval_steps += 1
             if preds is None:
@@ -248,8 +207,6 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
-        ## create directory if it's missing
-        os.makedirs(os.path.dirname(output_eval_file), exist_ok=True)
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
@@ -260,15 +217,13 @@ def evaluate(args, model, tokenizer, prefix=""):
 
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
+    # Use barrier to ensure only one process downloads and caches the dataset.
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
+
     processor = processors[task]()
     output_mode = output_modes[task]
-    cached_features_file = os.path.join(args.data_dir, 'cached_{}_{}_{}_{}'.format(
-        'dev' if evaluate else 'train',
-        list(filter(None, args.model_name_or_path.split('/'))).pop(),
-        str(args.max_seq_length),
-        str(task)))
+    cached_features_file = os.path.join(args.data_dir, f"cached_{'dev' if evaluate else 'train'}_{list(filter(None, args.model_name_or_path.split('/'))).pop()}_{args.max_seq_length}_{task}")
     if os.path.exists(cached_features_file):
         logger.info("Loading features from cached file %s", cached_features_file)
         features = torch.load(cached_features_file)
@@ -311,15 +266,15 @@ def main():
 
     ## Required parameters
     parser.add_argument("--data_dir", default=None, type=str, required=True,
-                        help="The input data dir. Should contain the task files.")
+                        help="Input data directory with task files (e.g., train.tsv and dev.tsv).")
     parser.add_argument("--model_type", default=None, type=str, required=True,
-                        help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
+                        help="Model type (choose from: " + ", ".join(MODEL_CLASSES.keys()) + ").")
     parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
-                        help="Path to pre-trained model or shortcut name.")
+                        help="Pretrained model name or path (e.g., bert-base-cased).")
     parser.add_argument("--task_name", default=None, type=str, required=True,
-                        help="The name of the task to train from: " + ", ".join(processors.keys()))
+                        help="Task name (choose from: " + ", ".join(processors.keys()) + ").")
     parser.add_argument("--output_dir", default=None, type=str, required=True,
-                        help="The output directory where predictions and checkpoints will be written.")
+                        help="Output directory where predictions and checkpoints will be written.")
 
     ## Other parameters
     parser.add_argument("--config_name", default="", type=str,
@@ -327,21 +282,18 @@ def main():
     parser.add_argument("--tokenizer_name", default="", type=str,
                         help="Pretrained tokenizer name or path if not the same as model_name")
     parser.add_argument("--cache_dir", default="", type=str,
-                        help="Where to store the pre-trained models downloaded from s3")
+                        help="Where to store the pretrained models downloaded from s3")
     parser.add_argument("--max_seq_length", default=128, type=int,
                         help="Maximum total input sequence length after tokenization.")
-    parser.add_argument("--do_train", action='store_true',
-                        help="Whether to run training.")
-    parser.add_argument("--do_eval", action='store_true',
-                        help="Whether to run eval on the dev set.")
-    parser.add_argument("--do_lower_case", action='store_true',
-                        help="Set this flag if you are using an uncased model.")
+    parser.add_argument("--do_train", action='store_true', help="Whether to run training.")
+    parser.add_argument("--do_eval", action='store_true', help="Whether to run eval on the dev set.")
+    parser.add_argument("--do_lower_case", action='store_true', help="Set this flag if you are using an uncased model.")
     parser.add_argument("--per_device_train_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--per_device_eval_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of steps to accumulate before performing a backward/update pass.")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Number of update steps to accumulate before performing a backward/update pass.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="Initial learning rate for Adam.")
     parser.add_argument("--weight_decay", default=0.0, type=float,
@@ -350,8 +302,8 @@ def main():
                         help="Epsilon for Adam optimizer.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
-    parser.add_argument("--num_train_epochs", default=1.0, type=float,  # For Task 2,3: 1 epoch
-                        help="Total number of training epochs to perform.")
+    parser.add_argument("--num_train_epochs", default=1.0, type=float,
+                        help="Total number of training epochs to perform (set to 1 for Task 3).")
     parser.add_argument("--max_steps", default=-1, type=int,
                         help="If > 0: total number of training steps to perform. Overrides num_train_epochs.")
     parser.add_argument("--warmup_steps", default=0, type=int,
@@ -359,27 +311,27 @@ def main():
 
     parser.add_argument("--no_cuda", action='store_true',
                         help="Avoid using CUDA when available")
-    parser.add_argument('--overwrite_output_dir', action='store_true',
+    parser.add_argument("--overwrite_output_dir", action='store_true',
                         help="Overwrite the content of the output directory")
-    parser.add_argument('--overwrite_cache', action='store_true',
+    parser.add_argument("--overwrite_cache", action='store_true',
                         help="Overwrite the cached training and evaluation sets")
-    parser.add_argument('--seed', type=int, default=42,
+    parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for initialization")
 
-    parser.add_argument('--fp16', action='store_true',
-                        help="Whether to use 16-bit (mixed) precision instead of 32-bit")
-    parser.add_argument('--fp16_opt_level', type=str, default='O1',
+    parser.add_argument("--fp16", action='store_true',
+                        help="Use 16-bit (mixed) precision instead of 32-bit")
+    parser.add_argument("--fp16_opt_level", type=str, default="O1",
                         help="Apex AMP optimization level")
     parser.add_argument("--local_rank", type=int, default=-1,
-                        help="For distributed training: local_rank. If single-node training, defaults to -1.")
+                        help="For distributed training: local_rank (if single-node training, default -1)")
 
-    # Task 2a: Distributed training arguments
+    # Distributed training arguments
     parser.add_argument("--world_size", type=int, default=1,
                         help="Total number of distributed processes (workers)")
     parser.add_argument("--master_ip", type=str, default="localhost",
                         help="Master node's IP address")
-    parser.add_argument("--master_port", type=str, default="29500",
-                        help="Master node's port")
+    parser.add_argument("--master_port", type=str, default="12345",
+                        help="Master node's port (non-privileged, >1023)")
 
     args = parser.parse_args()
 
@@ -392,18 +344,20 @@ def main():
 
     if args.world_size > 1:
         backend = "nccl" if torch.cuda.is_available() and not args.no_cuda else "gloo"
-        torch.distributed.init_process_group(backend=backend,
-                                             init_method=f"tcp://{args.master_ip}:{args.master_port}",
-                                             world_size=args.world_size,
-                                             rank=args.local_rank)
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size,
+            rank=args.local_rank
+        )
+
     # Setup logging
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
                         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
-    logger.warning("Process rank: %s, device: %s, distributed training: %s, 16-bits training: %s",
+    logger.warning("Process rank: %s, device: %s, distributed training: %s, fp16: %s",
                    args.local_rank, args.device, (args.world_size > 1), args.fp16)
 
-    # Set seed
     set_seed(args)
 
     # Prepare GLUE task
@@ -416,7 +370,7 @@ def main():
     num_labels = len(label_list)
 
     if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # Only first process downloads model & vocab
+        torch.distributed.barrier()  # Ensure only the first process downloads model & vocab
 
     args.model_type = args.model_type.lower()
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
@@ -425,15 +379,19 @@ def main():
     tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name else args.model_name_or_path,
                                                   do_lower_case=args.do_lower_case)
     
-    ##################################################
-    # Task 2a: Load the model using from_pretrained, passing in config.
+    # Load pretrained model
     model = model_class.from_pretrained(args.model_name_or_path, config=config)
-    ##################################################
 
     if args.local_rank == 0:
-        torch.distributed.barrier()  # Ensure only the first process downloads model & vocab
+        torch.distributed.barrier()
 
     model.to(args.device)
+
+    # Wrap model with DistributedDataParallel
+    if args.world_size > 1:
+        # If using GPUs, pass the device_ids argument.
+        model = torch.nn.parallel.DistributedDataParallel(model,
+                                                          device_ids=[args.local_rank] if args.device.type == "cuda" else None)
 
     logger.info("Training/evaluation parameters %s", args)
 
