@@ -248,6 +248,8 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+        ## create directory if it's missing
+        os.makedirs(os.path.dirname(output_eval_file), exist_ok=True)
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
