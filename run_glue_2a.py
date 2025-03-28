@@ -396,10 +396,11 @@ def main():
                                              init_method=f"tcp://{args.master_ip}:{args.master_port}",
                                              world_size=args.world_size,
                                              rank=args.local_rank)
+
     # Setup logging
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+                        level=logging.INFO)
     logger.warning("Process rank: %s, device: %s, distributed training: %s, 16-bits training: %s",
                    args.local_rank, args.device, (args.world_size > 1), args.fp16)
 
